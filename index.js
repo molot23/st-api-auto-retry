@@ -1,14 +1,14 @@
 /**
- * st-api-auto-retry — SillyTavern 扩展：上游 API 错误自动重试（可确认）
+ * st-api-auto-retry — SillyTavern 扩展：仅对话生成失败时自动重试（可确认）
  * Author: molot23
- * Version: 1.1.0
+ * Version: 1.2.0
  */
 (function () {
     'use strict';
 
     const MODULE_NAME = 'st-api-auto-retry';
     const LOG_PREFIX = '[API自动重试]';
-    const VERSION = '1.1.0';
+    const VERSION = '1.2.0';
     const STATUS_MARKER = '[API自动重试]';
 
     const defaultSettings = Object.freeze({
@@ -18,63 +18,22 @@
         baseDelayMs: 2000,
         exponentialBackoff: true,
         retryStatusCodes: [408, 429, 500, 502, 503, 504, 524],
-        generationOnly: true,
     });
 
-    /** Path fragments that look like ST / proxy generation requests */
-    const GENERATION_PATH_HINTS = [
-        'chat/completions',
-        'completions',
-        'generate',
-        'openai',
-        'backends/chat-completions',
-        'backends/text-completions',
-        'text-completions',
-        'chat-completions',
-        'api/openai',
-        'api/backends',
-        'api/generate',
-        'v1/chat',
-        'v1/completions',
-        'novelai',
-        'claude',
-        'gemini',
-        'makersuite',
-        'openrouter',
-        'aihorde',
-        'kobold',
-        'ooba',
-        'tabby',
-        'togetherai',
-        'mistral',
-        'cohere',
-        'perplexity',
-        'deepseek',
-        'groq',
-        'fireworks',
-        'custom',
-    ];
-
-    /** Paths we never retry (updates, translations, assets, etc.) */
-    const EXCLUDE_PATH_HINTS = [
-        'extensions/update',
-        'extensions/install',
-        'extensions/delete',
-        'translate',
-        'assets',
-        'csrf-token',
-        'version',
-        'settings',
-        'characters/all',
-        'chats/',
-        'files/',
-        'sprites',
-        'backgrounds',
-        'themes',
-        'worldinfo',
-        'stats',
-        'user',
-    ];
+    /**
+     * Exact SillyTavern server paths used for **main chat reply** generation.
+     * Hard-deny everything else (extensions update, translate, assets, settings,
+     * characters, chats save, files, version, csrf, themes, worldinfo, status, …).
+     * Quiet / secondary prompts hit the same URL but carry body.type === "quiet"
+     * and are skipped separately.
+     */
+    const CHAT_GENERATE_ALLOWLIST = Object.freeze([
+        '/api/backends/chat-completions/generate',
+        '/api/backends/text-completions/generate',
+        '/api/backends/kobold/generate',
+        '/api/backends/koboldhorde/generate',
+        '/api/novelai/generate',
+    ]);
 
     /**
      * Body / message patterns that indicate a retriable upstream failure,
@@ -111,8 +70,6 @@
 
     const originalFetch = window.fetch.bind(window);
 
-    /** Prevents eventSource backup from looping with fetch-path retries */
-    let aar_inflight = false;
     /** Last recognized failure labels for status suffix */
     let lastRecognizedLabels = [];
 
@@ -145,6 +102,10 @@
             if (!Object.hasOwn(store[MODULE_NAME], key)) {
                 store[MODULE_NAME][key] = defaultSettings[key];
             }
+        }
+        // v1.2.0: generation-only is always on; drop legacy toggle if present
+        if (Object.hasOwn(store[MODULE_NAME], 'generationOnly')) {
+            delete store[MODULE_NAME].generationOnly;
         }
 
         return store[MODULE_NAME];
@@ -197,28 +158,52 @@
         }
     }
 
-    function isGenerationRequest(url) {
-        const settings = getSettings();
-        if (!settings.generationOnly) return true;
-
-        let path = url;
+    /**
+     * True only for allowlisted ST chat-generation endpoints (pathname match).
+     * Query strings are ignored; no fuzzy vendor / openai / custom substring matching.
+     */
+    function isChatGenerateUrl(url) {
+        let pathname = '';
         try {
             const u = new URL(url, window.location.origin);
-            path = (u.pathname + u.search).toLowerCase();
+            pathname = u.pathname;
         } catch (e) {
-            path = String(url).toLowerCase();
+            pathname = String(url || '').split('?')[0].split('#')[0];
         }
+        // Normalize trailing slash
+        pathname = pathname.replace(/\/+$/, '') || '/';
+        const lower = pathname.toLowerCase();
+        return CHAT_GENERATE_ALLOWLIST.some((p) => lower === p || lower.endsWith(p));
+    }
 
-        for (const ex of EXCLUDE_PATH_HINTS) {
-            if (path.includes(ex.toLowerCase())) return false;
+    /**
+     * Quiet / secondary generate calls share the same ST generate URL.
+     * ST puts type: "quiet" (also impersonate etc. for non-main) in the JSON body.
+     * We only skip quiet — main chat reply types: normal, continue, regenerate, swipe, …
+     */
+    function isQuietGenerateBody(body) {
+        if (body == null) return false;
+        let text = null;
+        if (typeof body === 'string') {
+            text = body;
+        } else if (body instanceof ArrayBuffer) {
+            try { text = new TextDecoder().decode(body); } catch (_) { return false; }
+        } else if (ArrayBuffer.isView && ArrayBuffer.isView(body)) {
+            try { text = new TextDecoder().decode(body); } catch (_) { return false; }
+        } else {
+            // ReadableStream / FormData / Blob — cannot inspect cheaply; allow (URL already gated)
+            return false;
         }
-
-        for (const hint of GENERATION_PATH_HINTS) {
-            if (path.includes(hint.toLowerCase())) return true;
+        const trimmed = text.trim();
+        if (!trimmed || trimmed[0] !== '{') return false;
+        try {
+            const obj = JSON.parse(trimmed);
+            const t = obj && obj.type;
+            if (typeof t === 'string' && t.toLowerCase() === 'quiet') return true;
+        } catch (_) {
+            // Fallback regex if JSON parse fails on partial/custom body
+            if (/["']type["']\s*:\s*["']quiet["']/i.test(trimmed)) return true;
         }
-
-        if (/\/api\/(backends|openai|generate)/i.test(path)) return true;
-
         return false;
     }
 
@@ -687,7 +672,8 @@
         const settings = getSettings();
         const url = getUrlString(input);
 
-        if (!settings.enabled || !isGenerationRequest(url)) {
+        // Always generation-only: exact ST chat generate endpoints
+        if (!settings.enabled || !isChatGenerateUrl(url)) {
             return originalFetch(input, init);
         }
 
@@ -702,13 +688,18 @@
             reusable = { url, init: init || {} };
         }
 
+        // Do not retry quiet prompts / secondary generateQuietPrompt traffic
+        if (isQuietGenerateBody(reusable.init?.body)) {
+            console.log(`${LOG_PREFIX} 跳过 quiet 生成请求（非主对话回复）`);
+            return originalFetch(reusable.url, makeAttemptInit(reusable.init));
+        }
+
         let attempt = 0; // 0 = first try; retries are 1..maxRetries
         let lastClassification = null;
         let lastResponse = null;
         let lastError = null;
         let cancelled = false;
 
-        aar_inflight = true;
         try {
             while (true) {
                 try {
@@ -863,182 +854,11 @@
                 }
             }
         } finally {
-            aar_inflight = false;
             // silence unused warnings in some linters
             void cancelled;
             void lastError;
             void lastResponse;
         }
-    }
-
-    // ---------- EventSource backup path ----------
-
-    function textLooksLikeRetriableFailure(text) {
-        return bodyLooksRetriable(text);
-    }
-
-    async function backupConfirmAndRegenerate(errorText) {
-        if (aar_inflight) return;
-        const settings = getSettings();
-        if (!settings.enabled) return;
-
-        const labels = extractRecognizedLabels(errorText);
-        if (!textLooksLikeRetriableFailure(errorText)) return;
-
-        aar_inflight = true;
-        try {
-            const maxRetries = Math.max(0, Number(settings.maxRetries) || 0);
-            toast('warning', '检测到生成失败（事件备份路径）', labels.join(' / ') || '可重试错误');
-
-            let shouldRetry = true;
-            if (settings.confirmBeforeRetry) {
-                shouldRetry = await askUserConfirm(
-                    `检测到可重试错误（fetch 路径可能未拦截）：\n${String(errorText).slice(0, 400)}\n\n` +
-                    `识别：${labels.join(' / ') || '未知'}\n\n是否触发重新生成？`
-                );
-            }
-            if (!shouldRetry) {
-                const suffix = formatStatusSuffix({
-                    attemptsDone: 1,
-                    maxRetries,
-                    cancelled: true,
-                    labels,
-                });
-                toast('info', '已取消重试');
-                appendStatusToLastChatMessage(suffix);
-                return;
-            }
-
-            toast('info', '正在通过重新生成重试…', labels.join(' / ') || '');
-            const delay = computeDelay(1, settings);
-            if (delay > 0) await sleep(delay);
-
-            const ctx = getContextSafe();
-            // Prefer Generate / regenerate APIs without infinite loops (aar_inflight guards)
-            if (typeof window.Generate === 'function') {
-                await window.Generate('normal');
-            } else if (typeof ctx?.generate === 'function') {
-                await ctx.generate();
-            } else if (typeof window.regenerateLastMessage === 'function') {
-                await window.regenerateLastMessage();
-            } else {
-                // Fallback: click swipe regenerate if present
-                const $ = window.jQuery || window.$;
-                const $btn = $?.('#option_regenerate, .mes_edit_regenerate, #regenerate').first();
-                if ($btn?.length) $btn.trigger('click');
-                else toast('warning', '无法触发重新生成：未找到 Generate API');
-            }
-        } catch (e) {
-            console.warn(`${LOG_PREFIX} backup regenerate failed`, e);
-            toast('error', '备份重试失败', e.message || String(e));
-        } finally {
-            // Small delay before clearing so nested fetch path can set its own flag
-            setTimeout(() => { aar_inflight = false; }, 500);
-        }
-    }
-
-    function installEventSourceBackup() {
-        const tryBind = () => {
-            try {
-                const ctx = getContextSafe();
-                const es = ctx?.eventSource;
-                const types = ctx?.event_types || window.event_types;
-                if (!es || !types) return false;
-
-                if (window.__stApiAutoRetryEventBound) return true;
-                window.__stApiAutoRetryEventBound = true;
-
-                const onFail = (data) => {
-                    if (aar_inflight) return;
-                    const settings = getSettings();
-                    if (!settings.enabled) return;
-
-                    let text = '';
-                    if (typeof data === 'string') text = data;
-                    else if (data && typeof data === 'object') {
-                        text = data.error || data.message || data.reason
-                            || data.err?.message || JSON.stringify(data);
-                    }
-                    // Also peek last chat message
-                    try {
-                        const chat = ctx.chat;
-                        if (Array.isArray(chat) && chat.length) {
-                            const last = chat[chat.length - 1];
-                            if (last?.mes) text = `${text}\n${last.mes}`;
-                        }
-                    } catch (_) { /* ignore */ }
-
-                    if (textLooksLikeRetriableFailure(text)) {
-                        console.log(`${LOG_PREFIX} eventSource 备份路径命中`, text.slice(0, 200));
-                        // Defer so ST can finish writing [API 错误] into chat
-                        setTimeout(() => backupConfirmAndRegenerate(text), 400);
-                    }
-                };
-
-                const failEvents = [
-                    types.GENERATION_ENDED,
-                    types.GENERATION_STOPPED,
-                    types.CHAT_COMPLETION_SETTINGS_READY, // unlikely fail
-                ].filter(Boolean);
-
-                // Common ST failure event names (vary by version)
-                const extraNames = [
-                    'generation_error',
-                    'GENERATION_ERROR',
-                    'generation_ended',
-                    'js_error',
-                ];
-
-                for (const ev of failEvents) {
-                    try { es.on(ev, onFail); } catch (_) { /* ignore */ }
-                }
-                for (const name of extraNames) {
-                    try { es.on(name, onFail); } catch (_) { /* ignore */ }
-                }
-
-                // Also watch toastr/error path via MutationObserver on toasts — light touch
-                try {
-                    const observer = new MutationObserver((mutations) => {
-                        if (aar_inflight) return;
-                        for (const m of mutations) {
-                            for (const node of m.addedNodes || []) {
-                                if (!(node instanceof HTMLElement)) continue;
-                                const t = node.textContent || '';
-                                if (/后端错误|Failed to generate chat completion|status 524|openai_error/i.test(t)) {
-                                    console.log(`${LOG_PREFIX} toast 观察命中`);
-                                    setTimeout(() => backupConfirmAndRegenerate(t), 400);
-                                    return;
-                                }
-                            }
-                        }
-                    });
-                    const toastRoot = document.getElementById('toast-container')
-                        || document.querySelector('.toast-top-center, #toasts, .toastr');
-                    if (toastRoot) {
-                        observer.observe(toastRoot, { childList: true, subtree: true });
-                    } else {
-                        // Observe body for late toast container
-                        observer.observe(document.body, { childList: true, subtree: false });
-                    }
-                    window.__stApiAutoRetryToastObserver = observer;
-                } catch (e) {
-                    console.warn(`${LOG_PREFIX} toast observer failed`, e);
-                }
-
-                console.log(`${LOG_PREFIX} eventSource 备份路径已绑定`);
-                return true;
-            } catch (e) {
-                console.warn(`${LOG_PREFIX} installEventSourceBackup failed`, e);
-                return false;
-            }
-        };
-
-        if (tryBind()) return;
-        let tries = 0;
-        const timer = setInterval(() => {
-            tries += 1;
-            if (tryBind() || tries > 40) clearInterval(timer);
-        }, 500);
     }
 
     // ---------- Settings UI ----------
@@ -1053,9 +873,10 @@
     </div>
     <div class="inline-drawer-content">
       <p class="st-api-auto-retry-desc">
-        在上游 API 返回可重试错误（如 524 / 502 / 503 / 429 / 超时）时自动或确认后重试。
-        <b>v1.1.0</b> 会从响应正文识别被 ST 包装的 524 / openai_error（不仅看 HTTP 状态码），
-        并在最终失败时把重试状态写入返回文本 / 聊天消息。
+        <b>仅对话生成</b>：只拦截 SillyTavern 主对话回复的 generate 接口失败并重试，
+        不检测扩展更新、翻译、资源、设置等其它网络请求。
+        <b>v1.2.0</b> 会从响应正文识别被 ST 包装的 524 / openai_error（不仅看 HTTP 状态码），
+        并在最终失败时把重试状态写入返回文本 / 聊天消息。quiet 旁路生成不会重试。
         调试完成后可将「重试前手动确认」关闭。
       </p>
 
@@ -1091,11 +912,15 @@
       </label>
       <input id="st_aar_status_codes" class="text_pole wide100p" type="text" placeholder="408,429,500,502,503,504,524" />
 
-      <label class="checkbox_label" for="st_aar_gen_only">
-        <input id="st_aar_gen_only" type="checkbox" />
-        <span>仅拦截生成相关请求</span>
-      </label>
-      <small class="st-api-auto-retry-hint">尽量只对 chat/completions、openai、generate 等路径重试，避免误伤扩展更新/翻译等。正文匹配 524/openai_error 时即使状态码不在列表也会重试。</small>
+      <p class="st-api-auto-retry-hint">
+        作用范围固定为对话生成接口：
+        <code>/api/backends/chat-completions/generate</code>、
+        <code>/api/backends/text-completions/generate</code>、
+        <code>/api/backends/kobold/generate</code>、
+        <code>/api/backends/koboldhorde/generate</code>、
+        <code>/api/novelai/generate</code>。
+        正文匹配 524/openai_error 时即使状态码不在列表也会重试。
+      </p>
 
       <div class="st-api-auto-retry-footer">
         <small>版本 ${VERSION} · molot23</small>
@@ -1119,7 +944,6 @@
             ? s.retryStatusCodes.join(',')
             : String(s.retryStatusCodes || '');
         $('#st_aar_status_codes').val(codes);
-        $('#st_aar_gen_only').prop('checked', !!s.generationOnly);
     }
 
     function bindSettingsEvents() {
@@ -1155,11 +979,6 @@
 
         $('#st_aar_status_codes').off('input.stAar change.stAar').on('input.stAar change.stAar', function () {
             getSettings().retryStatusCodes = parseStatusCodes($(this).val());
-            saveSettings();
-        });
-
-        $('#st_aar_gen_only').off('input.stAar change.stAar').on('input.stAar change.stAar', function () {
-            getSettings().generationOnly = Boolean($(this).prop('checked'));
             saveSettings();
         });
     }
@@ -1228,9 +1047,8 @@
         getSettings();
         installFetchPatch();
         waitAndInjectSettings();
-        installEventSourceBackup();
-        toast('info', `扩展已加载 v${VERSION}`, 'API 自动重试');
-        console.log(`${LOG_PREFIX} v${VERSION} 初始化完成`);
+        toast('info', `扩展已加载 v${VERSION}（仅对话生成）`, 'API 自动重试');
+        console.log(`${LOG_PREFIX} v${VERSION} 初始化完成（仅对话 generate 白名单）`);
     }
 
     if (typeof jQuery !== 'undefined') {
