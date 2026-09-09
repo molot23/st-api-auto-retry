@@ -1,0 +1,12 @@
+{
+    "display_name": "API 自动重试",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "molot23",
+    "version": "1.0.0",
+    "homePage": "https://github.com/molot23/st-api-auto-retry",
+    "auto_update": true
+}
