@@ -1,14 +1,14 @@
 /**
  * st-api-auto-retry — SillyTavern 扩展：仅对话生成失败时自动重试（可确认）
  * Author: molot23
- * Version: 1.3.0
+ * Version: 1.4.0
  */
 (function () {
     'use strict';
 
     const MODULE_NAME = 'st-api-auto-retry';
     const LOG_PREFIX = '[API自动重试]';
-    const VERSION = '1.3.0';
+    const VERSION = '1.4.0';
     const STATUS_MARKER = '[API自动重试]';
     const PLACEHOLDER_EXTRA_TYPE = 'st_api_auto_retry_placeholder';
     const PLACEHOLDER_DOM_CLASS = 'st-aar-placeholder';
@@ -17,6 +17,7 @@
     const defaultSettings = Object.freeze({
         enabled: true,
         confirmBeforeRetry: true,
+        retryEmptyReply: true,
         maxRetries: 3,
         baseDelayMs: 2000,
         exponentialBackoff: true,
@@ -269,6 +270,239 @@
     }
 
     /**
+     * True if a string is missing / null / "" / whitespace-only.
+     */
+    function isBlankContent(value) {
+        if (value == null) return true;
+        if (typeof value === 'string') return value.trim() === '';
+        return false;
+    }
+
+    /**
+     * OpenAI-style message.content may be a string or multimodal part array.
+     * Returns true only when there is no usable assistant text (and no non-text parts).
+     */
+    function messageContentIsEmpty(content) {
+        if (content == null) return true;
+        if (typeof content === 'string') return content.trim() === '';
+        if (Array.isArray(content)) {
+            if (content.length === 0) return true;
+            let sawNonText = false;
+            let anyText = false;
+            for (const part of content) {
+                if (part == null) continue;
+                if (typeof part === 'string') {
+                    if (part.trim()) anyText = true;
+                    continue;
+                }
+                if (typeof part === 'object') {
+                    const t = part.text ?? part.content;
+                    if (typeof t === 'string') {
+                        if (t.trim()) anyText = true;
+                        continue;
+                    }
+                    // image_url / input_audio / etc. counts as non-empty payload
+                    if (part.type && part.type !== 'text') {
+                        sawNonText = true;
+                        continue;
+                    }
+                    if (part.image_url || part.input_audio || part.file) {
+                        sawNonText = true;
+                    }
+                }
+            }
+            if (sawNonText) return false;
+            return !anyText;
+        }
+        // Unexpected object — do not treat as empty
+        return false;
+    }
+
+    function choiceHasToolOrFunctionCall(choice) {
+        if (!choice || typeof choice !== 'object') return false;
+        const msg = choice.message || choice.delta || null;
+        if (!msg || typeof msg !== 'object') return false;
+        if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
+        if (msg.function_call && typeof msg.function_call === 'object') return true;
+        return false;
+    }
+
+    /**
+     * Detect intentional cancel/abort markers so we do not retry those as 空回复.
+     */
+    function looksCancelledOrAborted(json, text) {
+        if (json && typeof json === 'object') {
+            if (json.cancelled === true || json.canceled === true || json.aborted === true) return true;
+            const fr = json.choices?.[0]?.finish_reason || json.choices?.[0]?.native_finish_reason;
+            if (typeof fr === 'string' && /^(abort|aborted|cancel|cancelled|canceled)$/i.test(fr)) return true;
+            const err = json.error;
+            if (err) {
+                const msg = typeof err === 'string' ? err : (err.message || JSON.stringify(err));
+                if (/abort|cancelled|canceled|用户中止|已取消/i.test(String(msg))) return true;
+            }
+        }
+        if (text && /generat(e|ion)\s+(was\s+)?(abort|cancel)|request\s+(aborted|cancelled)|用户中止|已取消生成/i.test(text)) {
+            return true;
+        }
+        return false;
+    }
+
+    function isEventStreamResponse(response, text) {
+        try {
+            const ct = String(response?.headers?.get?.('content-type') || '').toLowerCase();
+            if (ct.includes('text/event-stream') || ct.includes('event-stream')) return true;
+        } catch (_) { /* ignore */ }
+        const head = String(text || '').slice(0, 400);
+        if (!head) return false;
+        // SSE heuristic: data: lines with JSON or [DONE]
+        return /(?:^|\n)\s*data:\s*(?:\{|\[DONE\])/m.test(head) && /\ndata:\s*/.test('\n' + head);
+    }
+
+    /**
+     * Non-stream OpenAI / text-completion JSON: empty assistant content?
+     * @returns {'empty'|'not-empty'|'n/a'}
+     */
+    function classifyJsonAssistantEmptiness(json) {
+        if (!json || typeof json !== 'object' || Array.isArray(json)) return 'n/a';
+        // Error payloads are handled elsewhere — never double-count as 空回复
+        if (json.error != null) return 'n/a';
+
+        if (Array.isArray(json.choices)) {
+            if (json.choices.length === 0) return 'empty';
+            const choice = json.choices[0];
+            if (!choice || typeof choice !== 'object') return 'empty';
+            if (choiceHasToolOrFunctionCall(choice)) return 'not-empty';
+
+            if (Object.prototype.hasOwnProperty.call(choice, 'message')) {
+                return messageContentIsEmpty(choice.message?.content) ? 'empty' : 'not-empty';
+            }
+            if (Object.prototype.hasOwnProperty.call(choice, 'text')) {
+                return isBlankContent(choice.text) ? 'empty' : 'not-empty';
+            }
+            // Rare: final non-stream wrapper still using delta
+            if (choice.delta) {
+                if (choiceHasToolOrFunctionCall({ delta: choice.delta })) return 'not-empty';
+                return messageContentIsEmpty(choice.delta.content) ? 'empty' : 'not-empty';
+            }
+            // choices[0] present but no known content fields
+            return 'empty';
+        }
+
+        return 'n/a';
+    }
+
+    /**
+     * Parse SSE / event-stream body: accumulate delta/message/text content.
+     * @returns {'empty'|'not-empty'|'n/a'}
+     */
+    function classifySseAssistantEmptiness(text) {
+        const raw = String(text || '');
+        if (!raw.trim()) return 'empty';
+
+        let accumulated = '';
+        let sawDataJson = false;
+        let hadToolCall = false;
+        let sawDone = false;
+        let sawError = false;
+
+        for (const line of raw.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith(':')) continue;
+            if (!trimmed.startsWith('data:')) continue;
+            const payload = trimmed.slice(5).trim();
+            if (!payload) continue;
+            if (payload === '[DONE]') {
+                sawDone = true;
+                continue;
+            }
+            try {
+                const obj = JSON.parse(payload);
+                if (obj && typeof obj === 'object') {
+                    if (obj.error != null) {
+                        sawError = true;
+                        break;
+                    }
+                    if (Array.isArray(obj.choices)) {
+                        sawDataJson = true;
+                        if (obj.choices.length === 0) continue;
+                        const choice = obj.choices[0] || {};
+                        if (choiceHasToolOrFunctionCall(choice)) hadToolCall = true;
+                        if (choice.message) {
+                            if (!messageContentIsEmpty(choice.message.content)
+                                && typeof choice.message.content === 'string') {
+                                accumulated = choice.message.content;
+                            } else if (typeof choice.message.content === 'string') {
+                                // keep empty string accumulation from full message replace
+                                accumulated = choice.message.content;
+                            } else if (!messageContentIsEmpty(choice.message.content)) {
+                                // multimodal non-empty
+                                return 'not-empty';
+                            }
+                        }
+                        if (choice.delta) {
+                            if (typeof choice.delta.content === 'string') {
+                                accumulated += choice.delta.content;
+                            } else if (choice.delta.content != null
+                                && !messageContentIsEmpty(choice.delta.content)) {
+                                return 'not-empty';
+                            }
+                        }
+                        if (typeof choice.text === 'string') {
+                            accumulated += choice.text;
+                        }
+                    }
+                }
+            } catch (_) {
+                /* ignore non-JSON data lines */
+            }
+        }
+
+        if (sawError) return 'n/a';
+        if (hadToolCall) return 'not-empty';
+        // Only judge emptiness when we saw stream JSON choices and/or a completed [DONE]
+        if (!sawDataJson && !sawDone) return 'n/a';
+        if (!sawDataJson && sawDone) return 'empty';
+        return accumulated.trim() === '' ? 'empty' : 'not-empty';
+    }
+
+    /**
+     * After HTTP/body-error patterns say "not an error", detect empty model content.
+     * Solid for non-stream JSON; for SSE uses clone text already buffered by readBodyText.
+     */
+    function detectEmptyAssistantReply(response, text) {
+        const raw = String(text || '');
+        let json = null;
+        const trimmed = raw.trim();
+        if (trimmed && (trimmed[0] === '{' || trimmed[0] === '[')) {
+            try { json = JSON.parse(trimmed); } catch (_) { json = null; }
+        }
+
+        if (looksCancelledOrAborted(json, raw)) {
+            return { empty: false, cancelled: true };
+        }
+
+        if (isEventStreamResponse(response, raw)) {
+            const kind = classifySseAssistantEmptiness(raw);
+            if (kind === 'empty') return { empty: true, via: 'sse' };
+            return { empty: false, via: 'sse', kind };
+        }
+
+        // Non-stream JSON (including ST completed wrappers that are not event-stream)
+        if (json && typeof json === 'object' && !Array.isArray(json)) {
+            const kind = classifyJsonAssistantEmptiness(json);
+            if (kind === 'empty') return { empty: true, via: 'json' };
+            return { empty: false, via: 'json', kind };
+        }
+
+        // Completely empty body on HTTP 200 for chat generate — treat as empty reply
+        if (response?.ok && !trimmed) {
+            return { empty: true, via: 'blank-body' };
+        }
+
+        return { empty: false, via: 'n/a' };
+    }
+
+    /**
      * Read response body text safely (clone first). Returns { text, labels }.
      */
     async function readBodyText(response) {
@@ -284,7 +518,8 @@
 
     /**
      * Decide whether a completed fetch response should be retried.
-     * Checks HTTP status AND body content (for wrapped 524s).
+     * Checks HTTP status AND body content (for wrapped 524s), then optionally
+     * empty assistant content (空回复) on otherwise-successful chat responses.
      */
     async function classifyResponse(response, settings) {
         const statusRetriable = isRetriableStatus(response.status, settings);
@@ -294,9 +529,10 @@
         // Prefer JSON error.message when present for labels
         let detailLabels = labels;
         let detailText = text;
+        let parsedJson = null;
         try {
-            const json = JSON.parse(text);
-            const errMsg = json?.error?.message || json?.error || json?.message || json?.detail;
+            parsedJson = JSON.parse(text);
+            const errMsg = parsedJson?.error?.message || parsedJson?.error || parsedJson?.message || parsedJson?.detail;
             if (errMsg) {
                 const msgStr = typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg);
                 detailText = msgStr;
@@ -340,6 +576,35 @@
                 labels: detailLabels,
                 status: response.status,
             };
+        }
+
+        // Empty assistant content on an otherwise non-error response (HTTP 200 + empty choices/content)
+        // Skipped when setting off, when JSON already had an error field, or when aborted/cancelled.
+        if (settings.retryEmptyReply !== false && response.ok) {
+            const hasErrorField = !!(parsedJson && typeof parsedJson === 'object' && parsedJson.error != null);
+            if (!hasErrorField) {
+                const emptyHit = detectEmptyAssistantReply(response, text);
+                if (emptyHit.cancelled) {
+                    return {
+                        retriable: false,
+                        reason: 'cancelled',
+                        text: detailText || text,
+                        fullText: text,
+                        labels: detailLabels,
+                        status: response.status,
+                    };
+                }
+                if (emptyHit.empty) {
+                    return {
+                        retriable: true,
+                        reason: 'empty-reply',
+                        text: '空回复（模型未返回有效内容）',
+                        fullText: text,
+                        labels: ['空回复'],
+                        status: response.status,
+                    };
+                }
+            }
         }
 
         return {
@@ -1259,8 +1524,9 @@
       <p class="st-api-auto-retry-desc">
         <b>仅对话生成</b>：只拦截 SillyTavern 主对话回复的 generate 接口失败并重试，
         不检测扩展更新、翻译、资源、设置等其它网络请求。
-        <b>v1.3.0</b> 在重试过程中向当前对话插入<b>一条</b>错误状态气泡（原因 / 进度 / 下次重试时间），
-        成功后移除并由 ST 渲染正常回复；全部失败或取消则保留该气泡。quiet 旁路生成不会重试。
+        <b>v1.4.0</b> 在重试过程中向当前对话插入<b>一条</b>错误状态气泡（原因 / 进度 / 下次重试时间），
+        成功后移除并由 ST 渲染正常回复；全部失败或取消则保留该气泡。
+        HTTP 200 但助手内容为空（空回复）可按下方选项重试。quiet 旁路生成不会重试。
         调试完成后可将「重试前手动确认」关闭。
       </p>
 
@@ -1274,6 +1540,12 @@
         <span>重试前手动确认</span>
       </label>
       <small class="st-api-auto-retry-hint">默认开启：每次重试前弹出确认框，便于调试；关闭后自动重试。</small>
+
+      <label class="checkbox_label" for="st_aar_empty_reply">
+        <input id="st_aar_empty_reply" type="checkbox" />
+        <span>空回复也重试</span>
+      </label>
+      <small class="st-api-auto-retry-hint">默认开启：HTTP 200 但 choices/content 为空或仅空白时，按可重试错误处理（标签「空回复」）。</small>
 
       <label for="st_aar_max_retries">
         <span>最大重试次数</span>
@@ -1303,7 +1575,8 @@
         <code>/api/backends/kobold/generate</code>、
         <code>/api/backends/koboldhorde/generate</code>、
         <code>/api/novelai/generate</code>。
-        正文匹配 524/openai_error 时即使状态码不在列表也会重试。
+        正文匹配 524/openai_error 时即使状态码不在列表也会重试；
+        开启「空回复也重试」时，非流式 JSON 空 content / 空 choices 同样重试。
       </p>
 
       <div class="st-api-auto-retry-footer">
@@ -1321,6 +1594,7 @@
 
         $('#st_aar_enabled').prop('checked', !!s.enabled);
         $('#st_aar_confirm').prop('checked', !!s.confirmBeforeRetry);
+        $('#st_aar_empty_reply').prop('checked', s.retryEmptyReply !== false);
         $('#st_aar_max_retries').val(Number(s.maxRetries));
         $('#st_aar_base_delay').val(Number(s.baseDelayMs));
         $('#st_aar_backoff').prop('checked', !!s.exponentialBackoff);
@@ -1341,6 +1615,11 @@
 
         $('#st_aar_confirm').off('input.stAar change.stAar').on('input.stAar change.stAar', function () {
             getSettings().confirmBeforeRetry = Boolean($(this).prop('checked'));
+            saveSettings();
+        });
+
+        $('#st_aar_empty_reply').off('input.stAar change.stAar').on('input.stAar change.stAar', function () {
+            getSettings().retryEmptyReply = Boolean($(this).prop('checked'));
             saveSettings();
         });
 
