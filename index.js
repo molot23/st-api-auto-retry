@@ -1,15 +1,18 @@
 /**
  * st-api-auto-retry — SillyTavern 扩展：仅对话生成失败时自动重试（可确认）
  * Author: molot23
- * Version: 1.2.0
+ * Version: 1.3.0
  */
 (function () {
     'use strict';
 
     const MODULE_NAME = 'st-api-auto-retry';
     const LOG_PREFIX = '[API自动重试]';
-    const VERSION = '1.2.0';
+    const VERSION = '1.3.0';
     const STATUS_MARKER = '[API自动重试]';
+    const PLACEHOLDER_EXTRA_TYPE = 'st_api_auto_retry_placeholder';
+    const PLACEHOLDER_DOM_CLASS = 'st-aar-placeholder';
+    const HANDLED_ABORT_FLAG = '__stAarHandledAbort';
 
     const defaultSettings = Object.freeze({
         enabled: true,
@@ -103,7 +106,7 @@
                 store[MODULE_NAME][key] = defaultSettings[key];
             }
         }
-        // v1.2.0: generation-only is always on; drop legacy toggle if present
+        // generation-only is always on; drop legacy toggle if present
         if (Object.hasOwn(store[MODULE_NAME], 'generationOnly')) {
             delete store[MODULE_NAME].generationOnly;
         }
@@ -440,8 +443,360 @@
         return `\n\n${STATUS_MARKER} 状态：已重试 ${attemptsDone}/${maxRetries} 次后仍失败（识别到 ${labelStr}）`;
     }
 
+    function formatDelayHint(delayMs) {
+        const ms = Math.max(0, Number(delayMs) || 0);
+        if (ms <= 0) return '立即';
+        if (ms < 1000) return `约 ${ms} 毫秒后`;
+        const sec = Math.round(ms / 1000);
+        try {
+            const when = new Date(Date.now() + ms);
+            const hh = String(when.getHours()).padStart(2, '0');
+            const mm = String(when.getMinutes()).padStart(2, '0');
+            const ss = String(when.getSeconds()).padStart(2, '0');
+            return `约 ${sec} 秒后（${hh}:${mm}:${ss}）`;
+        } catch (_) {
+            return `约 ${sec} 秒后`;
+        }
+    }
+
+    function formatReasonLabel(labels, status) {
+        if (labels && labels.length) return labels.join(' / ');
+        if (status) return `HTTP ${status}`;
+        return '可重试错误';
+    }
+
+    /**
+     * Build Chinese placeholder bubble text.
+     * @param {'pending'|'confirm'|'retrying'|'cancelled'|'exhausted'} phase
+     */
+    function formatPlaceholderMes({ phase, labels, status, nextAttempt, maxRetries, delayMs, attemptsDone }) {
+        const reason = formatReasonLabel(labels, status);
+        const lines = [STATUS_MARKER, `原因：${reason}`];
+
+        if (phase === 'confirm') {
+            lines.push(`进度：等待确认是否重试 ${nextAttempt}/${maxRetries}`);
+            if (delayMs > 0) lines.push(`确认后延迟：${formatDelayHint(delayMs)}`);
+            else lines.push('确认后将立即重试');
+        } else if (phase === 'retrying' || phase === 'pending') {
+            lines.push(`进度：将重试 ${nextAttempt}/${maxRetries}`);
+            lines.push(`下次重试：${formatDelayHint(delayMs)}`);
+        } else if (phase === 'cancelled') {
+            lines.push('状态：已取消重试');
+            if (attemptsDone != null) lines.push(`已失败：${attemptsDone} 次`);
+        } else if (phase === 'exhausted') {
+            const done = attemptsDone != null ? attemptsDone : maxRetries;
+            lines.push(`状态：已重试 ${done}/${maxRetries} 次后仍失败`);
+            lines.push('已保留此错误气泡（不再自动重试）');
+        }
+        return lines.join('\n');
+    }
+
+    function saveChatOptional() {
+        try {
+            const ctx = getContextSafe();
+            if (!ctx) return;
+            if (typeof ctx.saveChat === 'function') {
+                // getContext exposes saveChatConditional as saveChat
+                const ret = ctx.saveChat();
+                if (ret && typeof ret.then === 'function') {
+                    ret.catch(() => { /* ignore */ });
+                }
+                return;
+            }
+        } catch (_) { /* ignore */ }
+        try {
+            if (typeof saveChatDebounced === 'function') saveChatDebounced();
+            else if (typeof saveChatConditional === 'function') saveChatConditional();
+        } catch (_) { /* ignore */ }
+    }
+
+    function findPlaceholderIndex(chat) {
+        if (!Array.isArray(chat)) return -1;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const msg = chat[i];
+            if (!msg) continue;
+            if (msg.extra && msg.extra.type === PLACEHOLDER_EXTRA_TYPE) return i;
+            if (typeof msg.mes === 'string'
+                && msg.mes.startsWith(STATUS_MARKER)
+                && msg.extra && msg.extra.stAarPlaceholder) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    function markPlaceholderDom(mesId) {
+        try {
+            const $ = window.jQuery || window.$;
+            if ($) {
+                const $el = $(`#chat .mes[mesid="${mesId}"]`);
+                if ($el.length) {
+                    $el.addClass(PLACEHOLDER_DOM_CLASS);
+                    $el.attr('data-st-aar', '1');
+                }
+                return;
+            }
+            const el = document.querySelector(`#chat .mes[mesid="${mesId}"]`);
+            if (el) {
+                el.classList.add(PLACEHOLDER_DOM_CLASS);
+                el.setAttribute('data-st-aar', '1');
+            }
+        } catch (_) { /* ignore */ }
+    }
+
+    function buildPlaceholderMessage(mesText) {
+        const ctx = getContextSafe();
+        const extra = {
+            type: PLACEHOLDER_EXTRA_TYPE,
+            stAarPlaceholder: true,
+            swipeable: false,
+            isSmallSys: true,
+        };
+        // Exclude from prompt assembly when ST supports IGNORE_SYMBOL
+        try {
+            const ignoreSym = ctx?.symbols?.ignore;
+            if (ignoreSym) extra[ignoreSym] = true;
+        } catch (_) { /* ignore */ }
+
+        const name = (ctx && ctx.name2) ? ctx.name2 : 'API自动重试';
+        return {
+            name,
+            is_user: false,
+            is_system: true,
+            send_date: Date.now(),
+            mes: mesText,
+            extra,
+        };
+    }
+
+    /**
+     * Insert or update the single retry status bubble in the current chat.
+     * Returns mes index or -1.
+     */
+    function upsertPlaceholderBubble(mesText) {
+        try {
+            const ctx = getContextSafe();
+            if (!ctx || !Array.isArray(ctx.chat)) {
+                console.warn(`${LOG_PREFIX} 无法插入状态气泡：getContext().chat 不可用`);
+                return -1;
+            }
+            const chat = ctx.chat;
+            let idx = findPlaceholderIndex(chat);
+
+            if (idx >= 0) {
+                const msg = chat[idx];
+                msg.mes = mesText;
+                if (!msg.extra || typeof msg.extra !== 'object') msg.extra = {};
+                msg.extra.type = PLACEHOLDER_EXTRA_TYPE;
+                msg.extra.stAarPlaceholder = true;
+                msg.extra.swipeable = false;
+                msg.is_system = true;
+
+                try {
+                    if (typeof ctx.updateMessageBlock === 'function') {
+                        ctx.updateMessageBlock(idx, msg, { rerenderMessage: true });
+                    } else {
+                        const $ = window.jQuery || window.$;
+                        if ($) {
+                            const $text = $(`#chat .mes[mesid="${idx}"] .mes_text`);
+                            if ($text.length) {
+                                const formatted = typeof ctx.messageFormatting === 'function'
+                                    ? ctx.messageFormatting(mesText, msg.name, true, false, idx)
+                                    : mesText.replace(/\n/g, '<br>');
+                                $text.html(formatted);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`${LOG_PREFIX} 更新状态气泡失败`, e);
+                }
+                markPlaceholderDom(idx);
+                saveChatOptional();
+                return idx;
+            }
+
+            const message = buildPlaceholderMessage(mesText);
+            chat.push(message);
+            idx = chat.length - 1;
+
+            try {
+                if (typeof ctx.addOneMessage === 'function') {
+                    ctx.addOneMessage(message);
+                } else {
+                    // Minimal DOM fallback
+                    const $ = window.jQuery || window.$;
+                    if ($ && $('#chat').length) {
+                        const html = `<div class="mes ${PLACEHOLDER_DOM_CLASS}" mesid="${idx}" data-st-aar="1"><div class="mes_text">${mesText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')}</div></div>`;
+                        $('#chat').append(html);
+                    }
+                }
+            } catch (e) {
+                console.warn(`${LOG_PREFIX} 渲染状态气泡失败`, e);
+            }
+            markPlaceholderDom(idx);
+            saveChatOptional();
+            return idx;
+        } catch (e) {
+            console.warn(`${LOG_PREFIX} upsertPlaceholderBubble failed`, e);
+            return -1;
+        }
+    }
+
+    /**
+     * Remove the placeholder bubble from chat array + DOM so ST can render the real reply.
+     * Must be awaited on the success path before returning Response (swipe/saveReply last-message safety).
+     */
+    async function removePlaceholderBubble() {
+        try {
+            const ctx = getContextSafe();
+            if (!ctx || !Array.isArray(ctx.chat)) return false;
+            const chat = ctx.chat;
+            const idx = findPlaceholderIndex(chat);
+            if (idx < 0) return false;
+
+            // Prefer deleteLastMessage when we are still the tail (common case; safest for swipe)
+            if (idx === chat.length - 1 && typeof ctx.deleteLastMessage === 'function') {
+                try {
+                    const ret = ctx.deleteLastMessage();
+                    if (ret && typeof ret.then === 'function') await ret;
+                    cleanupPlaceholderDom();
+                    saveChatOptional();
+                    return true;
+                } catch (e) {
+                    console.warn(`${LOG_PREFIX} deleteLastMessage failed, trying deleteMessage`, e);
+                }
+            }
+
+            // Prefer official deleteMessage (rewrites mesids)
+            if (typeof ctx.deleteMessage === 'function') {
+                try {
+                    const ret = ctx.deleteMessage(idx, undefined, false);
+                    if (ret && typeof ret.then === 'function') {
+                        await ret;
+                    }
+                    // deleteMessage already saves; also strip any leftover DOM class nodes
+                    cleanupPlaceholderDom();
+                    return true;
+                } catch (e) {
+                    console.warn(`${LOG_PREFIX} deleteMessage failed, falling back`, e);
+                }
+            }
+
+            // Fallback: splice + DOM remove + reindex
+            chat.splice(idx, 1);
+            try {
+                const $ = window.jQuery || window.$;
+                if ($) {
+                    $(`#chat .mes[mesid="${idx}"]`).remove();
+                    $('#chat .mes').each(function (i) {
+                        $(this).attr('mesid', i);
+                    });
+                    $('#chat .mes').removeClass('last_mes').last().addClass('last_mes');
+                } else {
+                    const el = document.querySelector(`#chat .mes[mesid="${idx}"]`);
+                    if (el) el.remove();
+                }
+            } catch (_) { /* ignore */ }
+            cleanupPlaceholderDom();
+            saveChatOptional();
+            return true;
+        } catch (e) {
+            console.warn(`${LOG_PREFIX} removePlaceholderBubble failed`, e);
+            return false;
+        }
+    }
+
+    function cleanupPlaceholderDom() {
+        try {
+            const $ = window.jQuery || window.$;
+            if ($) {
+                $(`#chat .mes.${PLACEHOLDER_DOM_CLASS}, #chat .mes[data-st-aar="1"]`).each(function () {
+                    const mesid = $(this).attr('mesid');
+                    // Only remove if chat entry is gone / still marked
+                    const ctx = getContextSafe();
+                    const id = Number(mesid);
+                    const still = ctx?.chat?.[id]?.extra?.type === PLACEHOLDER_EXTRA_TYPE;
+                    if (!still) {
+                        // class cleanup only when message reused; if orphaned node, remove
+                        if (!ctx?.chat?.[id]) $(this).remove();
+                        else $(this).removeClass(PLACEHOLDER_DOM_CLASS).removeAttr('data-st-aar');
+                    }
+                });
+            }
+        } catch (_) { /* ignore */ }
+    }
+
+    /**
+     * After ST may have stacked a second [API 错误] bubble, remove/merge duplicates
+     * near the end of chat, keeping our placeholder if present.
+     */
+    function dedupeTrailingApiErrors() {
+        try {
+            const ctx = getContextSafe();
+            if (!ctx || !Array.isArray(ctx.chat) || ctx.chat.length === 0) return;
+            const chat = ctx.chat;
+            const phIdx = findPlaceholderIndex(chat);
+
+            const isStApiError = (msg) => {
+                if (!msg || typeof msg.mes !== 'string') return false;
+                if (msg.extra?.type === PLACEHOLDER_EXTRA_TYPE) return false;
+                return /\[API\s*错误\]/i.test(msg.mes)
+                    || /Custom OpenAI endpoint failed/i.test(msg.mes)
+                    || /Failed to generate chat completion/i.test(msg.mes)
+                    || (/openai_error/i.test(msg.mes) && /status\s*524|\b524\b/i.test(msg.mes));
+            };
+
+            // Scan last few messages; delete ST error bubbles that appeared after our placeholder
+            const start = Math.max(0, chat.length - 6);
+            const toDelete = [];
+            for (let i = chat.length - 1; i >= start; i--) {
+                if (i === phIdx) continue;
+                if (isStApiError(chat[i])) toDelete.push(i);
+            }
+            // Delete high indices first
+            for (const i of toDelete) {
+                if (typeof ctx.deleteMessage === 'function') {
+                    try {
+                        const ret = ctx.deleteMessage(i, undefined, false);
+                        if (ret && typeof ret.then === 'function') ret.catch(() => {});
+                        continue;
+                    } catch (_) { /* fall through */ }
+                }
+                chat.splice(i, 1);
+                try {
+                    const $ = window.jQuery || window.$;
+                    if ($) {
+                        $(`#chat .mes[mesid="${i}"]`).remove();
+                        $('#chat .mes').each(function (j) { $(this).attr('mesid', j); });
+                    }
+                } catch (_) { /* ignore */ }
+            }
+            if (toDelete.length) saveChatOptional();
+        } catch (e) {
+            console.warn(`${LOG_PREFIX} dedupeTrailingApiErrors failed`, e);
+        }
+    }
+
+    function scheduleDedupeApiErrors() {
+        setTimeout(() => dedupeTrailingApiErrors(), 200);
+        setTimeout(() => dedupeTrailingApiErrors(), 800);
+        setTimeout(() => dedupeTrailingApiErrors(), 1800);
+    }
+
+    function makeHandledAbort(reason) {
+        const err = new DOMException(String(reason || 'st-api-auto-retry abort'), 'AbortError');
+        try { err[HANDLED_ABORT_FLAG] = true; } catch (_) { /* ignore */ }
+        try { err.message = String(reason || err.message); } catch (_) { /* ignore */ }
+        return err;
+    }
+
+    function isHandledAbort(err) {
+        return !!(err && (err[HANDLED_ABORT_FLAG] || (isAbortError(err) && /st-api-auto-retry/i.test(String(err.message || '')))));
+    }
+
     /**
      * Build a new Response so ST surfaces our status line in chat / toast.
+     * Kept as fallback when abort is unavailable.
      */
     function buildAnnotatedErrorResponse(originalResponse, bodyText, statusSuffix, classification) {
         const status = originalResponse?.status && !originalResponse.ok
@@ -496,6 +851,7 @@
 
     /**
      * Append status line to the last chat message if ST already wrote [API 错误].
+     * Legacy fallback; preferred path is placeholder bubble + abort/dedupe.
      */
     function appendStatusToLastChatMessage(statusSuffix) {
         try {
@@ -510,7 +866,8 @@
                 const msg = chat[i];
                 if (!msg || typeof msg.mes !== 'string') continue;
                 const mes = msg.mes;
-                if (mes.includes(STATUS_MARKER)) return true; // already annotated
+                if (msg.extra?.type === PLACEHOLDER_EXTRA_TYPE) continue;
+                if (mes.includes(STATUS_MARKER) && mes.startsWith(STATUS_MARKER)) return true;
                 if (
                     /\[API\s*错误\]/i.test(mes)
                     || /Custom OpenAI endpoint failed/i.test(mes)
@@ -519,39 +876,29 @@
                     || /status\s*524/i.test(mes)
                 ) {
                     msg.mes = mes + statusSuffix;
-                    // Try to re-render
                     try {
-                        if (typeof ctx.reloadCurrentChat === 'function') {
-                            // Avoid full reload if we can update DOM / format in place
-                        }
-                        if (typeof ctx.updateChatMessage === 'function') {
-                            ctx.updateChatMessage(i);
-                        } else if (typeof ctx.messageFormatting === 'function') {
-                            // Fall through to DOM patch
-                        }
-                        // DOM: update last .mes with error text
-                        const $ = window.jQuery || window.$;
-                        if ($) {
-                            const $blocks = $('#chat .mes').filter(function () {
-                                const t = $(this).find('.mes_text').text() || '';
-                                return /\[API\s*错误\]|openai_error|status\s*524|Custom OpenAI/i.test(t);
-                            });
-                            if ($blocks.length) {
-                                const $last = $blocks.last();
-                                const $text = $last.find('.mes_text');
-                                if ($text.length && !$text.text().includes(STATUS_MARKER)) {
-                                    $text.append(document.createTextNode(statusSuffix));
+                        if (typeof ctx.updateMessageBlock === 'function') {
+                            ctx.updateMessageBlock(i, msg);
+                        } else {
+                            const $ = window.jQuery || window.$;
+                            if ($) {
+                                const $blocks = $('#chat .mes').filter(function () {
+                                    const t = $(this).find('.mes_text').text() || '';
+                                    return /\[API\s*错误\]|openai_error|status\s*524|Custom OpenAI/i.test(t);
+                                });
+                                if ($blocks.length) {
+                                    const $last = $blocks.last();
+                                    const $text = $last.find('.mes_text');
+                                    if ($text.length && !$text.text().includes(STATUS_MARKER)) {
+                                        $text.append(document.createTextNode(statusSuffix));
+                                    }
                                 }
                             }
                         }
                     } catch (e) {
                         console.warn(`${LOG_PREFIX} chat re-render failed`, e);
                     }
-                    // Persist if possible
-                    try {
-                        if (typeof ctx.saveChatDebounced === 'function') ctx.saveChatDebounced();
-                        else if (typeof ctx.saveChat === 'function') ctx.saveChat();
-                    } catch (_) { /* ignore */ }
+                    saveChatOptional();
                     return true;
                 }
             }
@@ -699,6 +1046,62 @@
         let lastResponse = null;
         let lastError = null;
         let cancelled = false;
+        let placeholderActive = false;
+
+        const showRetryBubble = ({ phase, classification, nextAttempt, delayMs, attemptsDone }) => {
+            const mes = formatPlaceholderMes({
+                phase,
+                labels: classification?.labels,
+                status: classification?.status,
+                nextAttempt,
+                maxRetries,
+                delayMs: delayMs || 0,
+                attemptsDone,
+            });
+            const idx = upsertPlaceholderBubble(mes);
+            placeholderActive = idx >= 0 || placeholderActive;
+            return idx;
+        };
+
+        const finishSuccess = async (response) => {
+            // Remove placeholder BEFORE returning so ST saveReply/swipe sees correct last message
+            if (placeholderActive) {
+                await removePlaceholderBubble();
+                placeholderActive = false;
+            }
+            return response;
+        };
+
+        const finishCancelled = (classification) => {
+            cancelled = true;
+            showRetryBubble({
+                phase: 'cancelled',
+                classification,
+                nextAttempt: Math.min(attempt + 1, maxRetries),
+                delayMs: 0,
+                attemptsDone: Math.max(1, attempt + 1),
+            });
+            toast('info', '已取消重试');
+            scheduleDedupeApiErrors();
+            throw makeHandledAbort('st-api-auto-retry: cancelled');
+        };
+
+        const finishExhausted = (classification, response, networkErr) => {
+            showRetryBubble({
+                phase: 'exhausted',
+                classification,
+                nextAttempt: maxRetries,
+                delayMs: 0,
+                // At least one failure occurred even when maxRetries === 0
+                attemptsDone: Math.max(attempt, 1),
+            });
+            const labelHint = classification?.labels?.join(' / ')
+                || (networkErr ? (networkErr.message || '网络错误') : `HTTP ${classification?.status || '?'}`);
+            toast('error', `已达最大重试次数（${attempt}/${maxRetries}）`, labelHint);
+            scheduleDedupeApiErrors();
+            // Prefer abort so ST does not stack a second [API 错误] bubble
+            throw makeHandledAbort('st-api-auto-retry: exhausted');
+        };
 
         try {
             while (true) {
@@ -711,37 +1114,32 @@
                     lastRecognizedLabels = classification.labels || [];
 
                     if (!classification.retriable) {
+                        // Non-retriable: if we never entered retry UX, pass through;
+                        // if we somehow had a bubble, remove on true success only.
+                        if (response.ok) {
+                            return await finishSuccess(response);
+                        }
+                        // Hard failure without retry — leave any bubble alone / don't create one
                         return response;
                     }
 
                     // Retriable failure
                     if (attempt >= maxRetries) {
-                        const suffix = formatStatusSuffix({
-                            attemptsDone: attempt,
-                            maxRetries,
-                            cancelled: false,
-                            labels: classification.labels,
-                        });
-                        toast('error', `已达最大重试次数（${attempt}/${maxRetries}）`,
-                            classification.labels?.join(' / ') || `HTTP ${response.status}`);
-                        const annotated = buildAnnotatedErrorResponse(
-                            response,
-                            classification.fullText || classification.text,
-                            suffix,
-                            classification,
-                        );
-                        // Also try to patch chat message shortly after ST writes it
-                        setTimeout(() => appendStatusToLastChatMessage(suffix), 300);
-                        setTimeout(() => appendStatusToLastChatMessage(suffix), 1200);
-                        return annotated;
+                        finishExhausted(classification, response, null);
                     }
 
                     const nextAttempt = attempt + 1;
-                    const summary = await summarizeForConfirm(classification, null);
                     const delay = computeDelay(nextAttempt, settings);
                     const labelHint = classification.labels?.join(' / ') || `HTTP ${response.status}`;
+                    const summary = await summarizeForConfirm(classification, null);
 
                     if (settings.confirmBeforeRetry) {
+                        showRetryBubble({
+                            phase: 'confirm',
+                            classification,
+                            nextAttempt,
+                            delayMs: delay,
+                        });
                         toast('warning', 'API 失败，等待确认重试…', labelHint);
                         const ok = await askUserConfirm(
                             `${summary}\n\n将进行第 ${nextAttempt}/${maxRetries} 次重试` +
@@ -749,26 +1147,16 @@
                             `\n\nURL: ${url.length > 120 ? url.slice(0, 120) + '…' : url}`
                         );
                         if (!ok) {
-                            cancelled = true;
-                            const suffix = formatStatusSuffix({
-                                attemptsDone: Math.max(1, attempt + 1),
-                                maxRetries,
-                                cancelled: true,
-                                labels: classification.labels,
-                            });
-                            toast('info', '已取消重试');
-                            const annotated = buildAnnotatedErrorResponse(
-                                response,
-                                classification.fullText || classification.text,
-                                suffix,
-                                classification,
-                            );
-                            setTimeout(() => appendStatusToLastChatMessage(suffix), 300);
-                            setTimeout(() => appendStatusToLastChatMessage(suffix), 1200);
-                            return annotated;
+                            finishCancelled(classification);
                         }
                     }
 
+                    showRetryBubble({
+                        phase: 'retrying',
+                        classification,
+                        nextAttempt,
+                        delayMs: delay,
+                    });
                     toast('info', `正在重试 ${nextAttempt}/${maxRetries}`, labelHint);
                     if (delay > 0) {
                         await sleep(delay, signal);
@@ -777,7 +1165,15 @@
                     attempt = nextAttempt;
                     continue;
                 } catch (err) {
+                    if (isHandledAbort(err)) {
+                        throw err;
+                    }
                     if (isAbortError(err)) {
+                        // User clicked stop / external abort — drop placeholder
+                        if (placeholderActive) {
+                            try { await removePlaceholderBubble(); } catch (_) { /* ignore */ }
+                            placeholderActive = false;
+                        }
                         throw err;
                     }
 
@@ -794,26 +1190,15 @@
                     lastRecognizedLabels = netClass.labels;
 
                     if (!netClass.retriable) {
+                        if (placeholderActive) {
+                            try { await removePlaceholderBubble(); } catch (_) { /* ignore */ }
+                            placeholderActive = false;
+                        }
                         throw err;
                     }
 
                     if (attempt >= maxRetries) {
-                        const suffix = formatStatusSuffix({
-                            attemptsDone: attempt,
-                            maxRetries,
-                            cancelled: false,
-                            labels: netClass.labels,
-                        });
-                        toast('error', `已达最大重试次数（${attempt}/${maxRetries}）`,
-                            err.message || '网络错误');
-                        // Annotate chat; rethrow so ST still sees failure
-                        setTimeout(() => appendStatusToLastChatMessage(suffix), 300);
-                        setTimeout(() => appendStatusToLastChatMessage(suffix), 1200);
-                        // Attach suffix onto error message for any catcher that reads it
-                        try {
-                            err.message = (err.message || String(err)) + suffix;
-                        } catch (_) { /* ignore */ }
-                        throw err;
+                        finishExhausted(lastClassification, null, err);
                     }
 
                     const nextAttempt = attempt + 1;
@@ -821,6 +1206,12 @@
                     const delay = computeDelay(nextAttempt, settings);
 
                     if (settings.confirmBeforeRetry) {
+                        showRetryBubble({
+                            phase: 'confirm',
+                            classification: lastClassification,
+                            nextAttempt,
+                            delayMs: delay,
+                        });
                         toast('warning', 'API 失败，等待确认重试…', err.name || '网络错误');
                         const ok = await askUserConfirm(
                             `${summary}\n\n将进行第 ${nextAttempt}/${maxRetries} 次重试` +
@@ -828,23 +1219,16 @@
                             `\n\nURL: ${url.length > 120 ? url.slice(0, 120) + '…' : url}`
                         );
                         if (!ok) {
-                            cancelled = true;
-                            const suffix = formatStatusSuffix({
-                                attemptsDone: Math.max(1, attempt + 1),
-                                maxRetries,
-                                cancelled: true,
-                                labels: netClass.labels,
-                            });
-                            toast('info', '已取消重试');
-                            setTimeout(() => appendStatusToLastChatMessage(suffix), 300);
-                            setTimeout(() => appendStatusToLastChatMessage(suffix), 1200);
-                            try {
-                                err.message = (err.message || String(err)) + suffix;
-                            } catch (_) { /* ignore */ }
-                            throw err;
+                            finishCancelled(lastClassification);
                         }
                     }
 
+                    showRetryBubble({
+                        phase: 'retrying',
+                        classification: lastClassification,
+                        nextAttempt,
+                        delayMs: delay,
+                    });
                     toast('info', `正在重试 ${nextAttempt}/${maxRetries}`, err.message || '网络错误');
                     if (delay > 0) {
                         await sleep(delay, signal);
@@ -854,10 +1238,10 @@
                 }
             }
         } finally {
-            // silence unused warnings in some linters
             void cancelled;
             void lastError;
             void lastResponse;
+            void lastClassification;
         }
     }
 
@@ -875,8 +1259,8 @@
       <p class="st-api-auto-retry-desc">
         <b>仅对话生成</b>：只拦截 SillyTavern 主对话回复的 generate 接口失败并重试，
         不检测扩展更新、翻译、资源、设置等其它网络请求。
-        <b>v1.2.0</b> 会从响应正文识别被 ST 包装的 524 / openai_error（不仅看 HTTP 状态码），
-        并在最终失败时把重试状态写入返回文本 / 聊天消息。quiet 旁路生成不会重试。
+        <b>v1.3.0</b> 在重试过程中向当前对话插入<b>一条</b>错误状态气泡（原因 / 进度 / 下次重试时间），
+        成功后移除并由 ST 渲染正常回复；全部失败或取消则保留该气泡。quiet 旁路生成不会重试。
         调试完成后可将「重试前手动确认」关闭。
       </p>
 

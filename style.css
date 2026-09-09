@@ -39,3 +39,19 @@
     margin-top: 0.75rem;
     opacity: 0.6;
 }
+
+
+/* Retry status placeholder bubble in chat */
+#chat .mes.st-aar-placeholder,
+#chat .mes[data-st-aar="1"] {
+    opacity: 0.95;
+}
+
+#chat .mes.st-aar-placeholder .mes_text,
+#chat .mes[data-st-aar="1"] .mes_text {
+    white-space: pre-wrap;
+    border-left: 3px solid rgba(220, 80, 80, 0.75);
+    padding-left: 0.6em;
+    opacity: 0.92;
+    font-size: 0.95em;
+}
