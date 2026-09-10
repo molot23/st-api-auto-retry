@@ -1,14 +1,14 @@
 /**
  * st-api-auto-retry — SillyTavern 扩展：仅对话生成失败时自动重试（可确认）
  * Author: molot23
- * Version: 1.4.0
+ * Version: 1.5.0
  */
 (function () {
     'use strict';
 
     const MODULE_NAME = 'st-api-auto-retry';
     const LOG_PREFIX = '[API自动重试]';
-    const VERSION = '1.4.0';
+    const VERSION = '1.5.0';
     const STATUS_MARKER = '[API自动重试]';
     const PLACEHOLDER_EXTRA_TYPE = 'st_api_auto_retry_placeholder';
     const PLACEHOLDER_DOM_CLASS = 'st-aar-placeholder';
@@ -18,6 +18,7 @@
         enabled: true,
         confirmBeforeRetry: true,
         retryEmptyReply: true,
+        scrollToNewMessageStart: true,
         maxRetries: 3,
         baseDelayMs: 2000,
         exponentialBackoff: true,
@@ -76,6 +77,147 @@
 
     /** Last recognized failure labels for status suffix */
     let lastRecognizedLabels = [];
+
+    /**
+     * After a successful (non-retriable) chat generate Response is returned to ST,
+     * arm a one-shot scroll so the newest assistant message starts at the top of
+     * #chat once ST finishes rendering (streaming: on final render, not per token).
+     */
+    let pendingScrollToStart = false;
+    let scrollToStartMesId = null;
+    let scrollHooksInstalled = false;
+
+    function armScrollToNewMessageStart() {
+        try {
+            const s = getSettings();
+            if (!s.enabled || s.scrollToNewMessageStart === false) {
+                pendingScrollToStart = false;
+                scrollToStartMesId = null;
+                return;
+            }
+            pendingScrollToStart = true;
+            scrollToStartMesId = null;
+        } catch (_) {
+            pendingScrollToStart = false;
+        }
+    }
+
+    /**
+     * Scroll so the target .mes top is visible at the top of #chat viewport.
+     * Uses #chat.scrollTop (not window) to avoid fighting outer page scroll.
+     * @param {number|string|null|undefined} messageId
+     */
+    function scrollMessageStartIntoChatView(messageId) {
+        try {
+            const chatEl = document.getElementById('chat');
+            if (!chatEl) return false;
+
+            let el = null;
+            if (messageId !== null && messageId !== undefined && messageId !== '') {
+                el = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+            }
+            if (!el) {
+                const nodes = document.querySelectorAll(`#chat .mes:not(.${PLACEHOLDER_DOM_CLASS})`);
+                el = nodes.length ? nodes[nodes.length - 1] : null;
+            }
+            if (!el || el.classList.contains(PLACEHOLDER_DOM_CLASS)) return false;
+
+            // Prefer precise scrollTop so message first line sits at chat viewport top
+            const chatRect = chatEl.getBoundingClientRect();
+            const elRect = el.getBoundingClientRect();
+            const nextTop = chatEl.scrollTop + (elRect.top - chatRect.top);
+            chatEl.scrollTop = Math.max(0, nextTop);
+
+            // Fallback / reinforce with scrollIntoView(block:'start') inside scrollable #chat
+            try {
+                el.scrollIntoView({ behavior: 'auto', block: 'start', inline: 'nearest' });
+            } catch (_) {
+                try {
+                    el.scrollIntoView(true);
+                } catch (__) { /* ignore */ }
+            }
+            return true;
+        } catch (e) {
+            console.warn(`${LOG_PREFIX} scrollMessageStartIntoChatView failed`, e);
+            return false;
+        }
+    }
+
+    /**
+     * Run after ST's own scrollChatToBottom (rAF) so we win the final scroll position.
+     * @param {number|string|null|undefined} messageId
+     * @param {string|undefined} type generation type from event
+     */
+    function scheduleScrollToNewMessageStart(messageId, type) {
+        if (!pendingScrollToStart) return;
+        if (type === 'quiet' || type === 'impersonate' || type === 'first_message') return;
+
+        const s = getSettings();
+        if (!s.enabled || s.scrollToNewMessageStart === false) {
+            pendingScrollToStart = false;
+            return;
+        }
+
+        if (messageId !== null && messageId !== undefined && messageId !== '') {
+            scrollToStartMesId = messageId;
+        }
+
+        // Consume the arm; still allow a few delayed corrections vs ST bottom-scroll
+        pendingScrollToStart = false;
+        const targetId = scrollToStartMesId;
+        scrollToStartMesId = null;
+
+        const run = () => scrollMessageStartIntoChatView(targetId);
+        // ST scrollChatToBottom uses requestAnimationFrame; outrun it with later frames + short timeouts
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                run();
+                setTimeout(run, 50);
+                setTimeout(run, 200);
+            });
+        });
+    }
+
+    function installScrollToStartHooks() {
+        if (scrollHooksInstalled) return true;
+        try {
+            const ctx = getContextSafe();
+            if (!ctx?.eventSource || !ctx?.event_types) return false;
+            const types = ctx.event_types;
+            const onRendered = (messageId, type) => {
+                scheduleScrollToNewMessageStart(messageId, type);
+            };
+            if (types.CHARACTER_MESSAGE_RENDERED) {
+                ctx.eventSource.on(types.CHARACTER_MESSAGE_RENDERED, onRendered);
+            }
+            if (types.MESSAGE_RECEIVED) {
+                // Backup: DOM may not be ready yet; scheduleScroll only acts if still pending
+                ctx.eventSource.on(types.MESSAGE_RECEIVED, (messageId, type) => {
+                    // Keep arm until CHARACTER_MESSAGE_RENDERED when possible; only scroll here
+                    // if RENDERED is unavailable. Prefer leaving pending for RENDERED.
+                    if (!types.CHARACTER_MESSAGE_RENDERED) {
+                        scheduleScrollToNewMessageStart(messageId, type);
+                    } else if (pendingScrollToStart && messageId !== null && messageId !== undefined) {
+                        scrollToStartMesId = messageId;
+                    }
+                });
+            }
+            if (types.GENERATION_ENDED) {
+                ctx.eventSource.on(types.GENERATION_ENDED, () => {
+                    // Fallback when render events already consumed pending, or fired without mes id
+                    if (pendingScrollToStart) {
+                        scheduleScrollToNewMessageStart(scrollToStartMesId, undefined);
+                    }
+                });
+            }
+            scrollHooksInstalled = true;
+            console.log(`${LOG_PREFIX} 已挂载成功后跳到新消息开头钩子`);
+            return true;
+        } catch (e) {
+            console.warn(`${LOG_PREFIX} installScrollToStartHooks failed`, e);
+            return false;
+        }
+    }
 
     function getContextSafe() {
         try {
@@ -1334,6 +1476,8 @@
                 await removePlaceholderBubble();
                 placeholderActive = false;
             }
+            // Arm scroll-to-start; actual jump waits for CHARACTER_MESSAGE_RENDERED / GENERATION_ENDED
+            armScrollToNewMessageStart();
             return response;
         };
 
@@ -1524,9 +1668,10 @@
       <p class="st-api-auto-retry-desc">
         <b>仅对话生成</b>：只拦截 SillyTavern 主对话回复的 generate 接口失败并重试，
         不检测扩展更新、翻译、资源、设置等其它网络请求。
-        <b>v1.4.0</b> 在重试过程中向当前对话插入<b>一条</b>错误状态气泡（原因 / 进度 / 下次重试时间），
+        <b>v1.5.0</b> 成功返回后可将聊天界面自动跳到<strong>新消息开头</strong>（不再停在末尾）。
+        重试过程中向当前对话插入<b>一条</b>错误状态气泡（原因 / 进度 / 下次重试时间），
         成功后移除并由 ST 渲染正常回复；全部失败或取消则保留该气泡。
-        HTTP 200 但助手内容为空（空回复）可按下方选项重试。quiet 旁路生成不会重试。
+        HTTP 200 但助手内容为空（空回复）可按下方选项重试。quiet 旁路生成不会重试、也不会抢滚动。
         调试完成后可将「重试前手动确认」关闭。
       </p>
 
@@ -1546,6 +1691,12 @@
         <span>空回复也重试</span>
       </label>
       <small class="st-api-auto-retry-hint">默认开启：HTTP 200 但 choices/content 为空或仅空白时，按可重试错误处理（标签「空回复」）。</small>
+
+      <label class="checkbox_label" for="st_aar_scroll_start">
+        <input id="st_aar_scroll_start" type="checkbox" />
+        <span>成功后跳到新消息开头</span>
+      </label>
+      <small class="st-api-auto-retry-hint">默认开启：主对话生成成功并渲染完成后，将 #chat 滚动到新助手消息的第一行（非末尾）；流式在整段结束后再跳，不在每个 token 上抢滚动。</small>
 
       <label for="st_aar_max_retries">
         <span>最大重试次数</span>
@@ -1595,6 +1746,7 @@
         $('#st_aar_enabled').prop('checked', !!s.enabled);
         $('#st_aar_confirm').prop('checked', !!s.confirmBeforeRetry);
         $('#st_aar_empty_reply').prop('checked', s.retryEmptyReply !== false);
+        $('#st_aar_scroll_start').prop('checked', s.scrollToNewMessageStart !== false);
         $('#st_aar_max_retries').val(Number(s.maxRetries));
         $('#st_aar_base_delay').val(Number(s.baseDelayMs));
         $('#st_aar_backoff').prop('checked', !!s.exponentialBackoff);
@@ -1620,6 +1772,11 @@
 
         $('#st_aar_empty_reply').off('input.stAar change.stAar').on('input.stAar change.stAar', function () {
             getSettings().retryEmptyReply = Boolean($(this).prop('checked'));
+            saveSettings();
+        });
+
+        $('#st_aar_scroll_start').off('input.stAar change.stAar').on('input.stAar change.stAar', function () {
+            getSettings().scrollToNewMessageStart = Boolean($(this).prop('checked'));
             saveSettings();
         });
 
@@ -1710,6 +1867,13 @@
         getSettings();
         installFetchPatch();
         waitAndInjectSettings();
+        if (!installScrollToStartHooks()) {
+            let tries = 0;
+            const timer = setInterval(() => {
+                tries += 1;
+                if (installScrollToStartHooks() || tries > 60) clearInterval(timer);
+            }, 500);
+        }
         toast('info', `扩展已加载 v${VERSION}（仅对话生成）`, 'API 自动重试');
         console.log(`${LOG_PREFIX} v${VERSION} 初始化完成（仅对话 generate 白名单）`);
     }
