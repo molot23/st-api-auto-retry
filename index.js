@@ -1,14 +1,14 @@
 /**
  * st-api-auto-retry — SillyTavern 扩展：仅对话生成失败时自动重试（可确认）
  * Author: molot23
- * Version: 1.5.0
+ * Version: 1.5.1
  */
 (function () {
     'use strict';
 
     const MODULE_NAME = 'st-api-auto-retry';
     const LOG_PREFIX = '[API自动重试]';
-    const VERSION = '1.5.0';
+    const VERSION = '1.5.1';
     const STATUS_MARKER = '[API自动重试]';
     const PLACEHOLDER_EXTRA_TYPE = 'st_api_auto_retry_placeholder';
     const PLACEHOLDER_DOM_CLASS = 'st-aar-placeholder';
@@ -866,9 +866,94 @@
         }
     }
 
+    /**
+     * Short Chinese explanations for recognized failure labels / HTTP codes.
+     * Display path: formatReasonLabel → formatPlaceholderMes / toasts.
+     */
+    const LABEL_ZH_DESCRIPTIONS = Object.freeze({
+        '524 / openai_error': '网关超时（上游太久没响应）',
+        '524': '网关超时（上游太久没响应）',
+        'openai_error': '上游 OpenAI 接口报错',
+        '504/Gateway Timeout': '网关超时',
+        '504': '网关超时',
+        '502': '上游服务暂时不可用',
+        '503': '上游服务暂时不可用',
+        '429': '请求过于频繁，被限流',
+        '408': '请求超时',
+        '500': '服务器内部错误',
+        '空回复': '接口返回成功但正文为空',
+        '网络中断': '连接中断或请求失败',
+        '网络错误': '连接中断或请求失败',
+        'Custom OpenAI endpoint failed': '自定义 OpenAI 端点失败',
+        'Internal error': '内部错误',
+    });
+
+    /**
+     * Normalize a raw label (or "HTTP 524") to a display key for the zh map.
+     * @param {string} label
+     * @returns {string}
+     */
+    function normalizeReasonKey(label) {
+        const raw = String(label || '').trim();
+        if (!raw) return '';
+        const http = raw.match(/^HTTP\s+(\d{3})$/i);
+        if (http) return http[1];
+        return raw;
+    }
+
+    /**
+     * One label → "code — 中文说明" (or label alone if unknown).
+     * @param {string} label
+     * @returns {string}
+     */
+    function describeLabel(label) {
+        const key = normalizeReasonKey(label);
+        if (!key) return '';
+        const zh = LABEL_ZH_DESCRIPTIONS[key];
+        if (zh) {
+            // Prefer bare code when key came from "HTTP NNN"
+            const display = /^HTTP\s+\d{3}$/i.test(String(label || '').trim()) ? key : String(label).trim();
+            return `${display} — ${zh}`;
+        }
+        return String(label).trim();
+    }
+
+    /**
+     * Format failure reason for placeholder 「原因：…」 and toast titles.
+     * Keeps codes where useful and always appends a short Chinese explanation when known.
+     * @param {string[]|null|undefined} labels
+     * @param {number|string|null|undefined} status
+     * @returns {string}
+     */
     function formatReasonLabel(labels, status) {
-        if (labels && labels.length) return labels.join(' / ');
-        if (status) return `HTTP ${status}`;
+        if (labels && labels.length) {
+            const set = new Set(labels.map(normalizeReasonKey).filter(Boolean));
+            const used = new Set();
+            const parts = [];
+
+            // Prefer combined 502/503 wording when both appear
+            if (set.has('502') && set.has('503')) {
+                parts.push('502/503 — 上游服务暂时不可用');
+                used.add('502');
+                used.add('503');
+            }
+
+            for (const label of labels) {
+                const key = normalizeReasonKey(label);
+                if (used.has(key)) continue;
+                if (key) used.add(key);
+                const described = describeLabel(label);
+                if (described) parts.push(described);
+            }
+            if (parts.length) return parts.join('；');
+        }
+
+        if (status) {
+            const code = String(status);
+            const zh = LABEL_ZH_DESCRIPTIONS[code];
+            if (zh) return `${code} — ${zh}`;
+            return `HTTP ${status}`;
+        }
         return '可重试错误';
     }
 
@@ -1417,7 +1502,7 @@
                 : classification.text)
             : '';
         const labels = classification.labels?.length
-            ? `\n识别：${classification.labels.join(' / ')}`
+            ? `\n识别：${formatReasonLabel(classification.labels, classification.status)}`
             : '';
         return detail ? `${statusLine}\n${detail}${labels}` : `${statusLine}${labels}`;
     }
@@ -1504,8 +1589,10 @@
                 // At least one failure occurred even when maxRetries === 0
                 attemptsDone: Math.max(attempt, 1),
             });
-            const labelHint = classification?.labels?.join(' / ')
-                || (networkErr ? (networkErr.message || '网络错误') : `HTTP ${classification?.status || '?'}`);
+            const labelHint = formatReasonLabel(
+                classification?.labels,
+                classification?.status,
+            ) || (networkErr ? formatReasonLabel(['网络错误'], 0) : '可重试错误');
             toast('error', `已达最大重试次数（${attempt}/${maxRetries}）`, labelHint);
             scheduleDedupeApiErrors();
             // Prefer abort so ST does not stack a second [API 错误] bubble
@@ -1539,7 +1626,7 @@
 
                     const nextAttempt = attempt + 1;
                     const delay = computeDelay(nextAttempt, settings);
-                    const labelHint = classification.labels?.join(' / ') || `HTTP ${response.status}`;
+                    const labelHint = formatReasonLabel(classification.labels, response.status);
                     const summary = await summarizeForConfirm(classification, null);
 
                     if (settings.confirmBeforeRetry) {
@@ -1621,7 +1708,7 @@
                             nextAttempt,
                             delayMs: delay,
                         });
-                        toast('warning', 'API 失败，等待确认重试…', err.name || '网络错误');
+                        toast('warning', 'API 失败，等待确认重试…', formatReasonLabel(lastClassification.labels, 0));
                         const ok = await askUserConfirm(
                             `${summary}\n\n将进行第 ${nextAttempt}/${maxRetries} 次重试` +
                             (delay > 0 ? `（延迟 ${delay} ms）` : '') +
@@ -1638,7 +1725,7 @@
                         nextAttempt,
                         delayMs: delay,
                     });
-                    toast('info', `正在重试 ${nextAttempt}/${maxRetries}`, err.message || '网络错误');
+                    toast('info', `正在重试 ${nextAttempt}/${maxRetries}`, formatReasonLabel(lastClassification.labels, 0));
                     if (delay > 0) {
                         await sleep(delay, signal);
                     }

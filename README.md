@@ -5,7 +5,7 @@ SillyTavern UI 扩展：**仅**在主对话回复生成失败时（上游 API �
 **不管**扩展更新、翻译、资源拉取、设置、角色卡、存档、主题、世界书等其它网络请求。
 
 **作者：** molot23  
-**版本：** 1.5.0
+**版本：** 1.5.1
 
 ---
 
@@ -21,7 +21,7 @@ https://github.com/molot23/st-api-auto-retry
 
 ---
 
-## 功能概览（v1.5.0 · 成功后跳到新消息开头）
+## 功能概览（v1.5.1 · 失败原因中文说明）
 
 - 谨慎劫持 `window.fetch`，**仅**对下列 SillyTavern 服务端「主对话 generate」路径介入（精确 pathname 白名单）：
   - `/api/backends/chat-completions/generate`
@@ -31,6 +31,7 @@ https://github.com/molot23/st-api-auto-retry
   - `/api/novelai/generate`
 - **不重试 quiet 旁路生成**（请求体 `type: "quiet"`）；主对话 `normal` / `continue` / `regenerate` / `swipe` 等会重试。
 - **正文识别可重试错误**（不仅看 HTTP 状态码）：SillyTavern 服务端常把上游 524 包装成浏览器侧 HTTP 500/200，错误只出现在 message/body。
+- **失败原因中文说明（v1.5.1）**：占位气泡「原因：…」与相关 toast / 确认摘要不再只显示裸数字或英文标签，而是附带简短中文解释（如 `524 — 网关超时（上游太久没响应）`、`空回复 — 接口返回成功但正文为空`、`429 — 请求过于频繁，被限流`）。
 - **成功后跳到新消息开头（v1.5.0）**：主对话 generate 成功返回（含首次成功与重试成功）后，在 ST 渲染完成时将 `#chat` 滚动到**新助手消息第一行**（`scrollTop` / `scrollIntoView({ block: 'start' })`），不再停在消息末尾。流式在整段结束后再跳，不在每个 token 上抢滚动；quiet 旁路生成不触发。可由设置关闭。
 - **空回复重试（v1.4.0）**：HTTP 200 且未被识别为 API 错误时，若助手内容为空则按可重试失败处理（标签「空回复」），走同一套确认 / 气泡 / 退避重试。
   - 非流式 JSON：检查 `choices` 为空、`choices[0].message.content` 缺失/null/空白、或 text-completion 的 `choices[0].text` 空白；已有 `error` 字段的不重复计为空回复；带 `tool_calls` / `function_call` 的不算空。
